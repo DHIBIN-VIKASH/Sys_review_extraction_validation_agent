@@ -121,9 +121,38 @@ def extract_data_from_page(page, pdf_path, prompt_text):
             
             time.sleep(2)
             
-            upload_item = page.locator("div[role='menuitem'], span, li").filter(has_text=re.compile(r"Upload", re.I)).first
-            upload_item.wait_for(state="visible", timeout=15000)
-            upload_item.click(force=True)
+            # Clcik the 'Upload' item with retries
+            upload_selectors = [
+                 "div[role='menuitem']:has-text('Upload')",
+                 "span:has-text('Upload')",
+                 "li:has-text('Upload')",
+                 "[aria-label*='Upload']",
+                 ".mat-mdc-menu-item:has-text('Upload')"
+            ]
+
+            upload_found = False
+            for target in upload_selectors:
+                try:
+                     upload_item = page.locator(target).first
+                     if upload_item.count() > 0 and upload_item.is_visible():
+                         upload_item.click(force=True, timeout=5000)
+                         upload_found = True
+                         break
+                except:
+                     continue
+            
+            if not upload_found:
+                 # Fallback
+                 try:
+                    upload_item = page.get_by_text("Upload", exact=False).first
+                    upload_item.click(force=True, timeout=5000)
+                    upload_found = True
+                 except:
+                    pass
+
+            if not upload_found:
+                 print(f"[{os.path.basename(pdf_path)}] Upload menu item not found.")
+                 return None
         
         file_chooser = fc_info.value
         file_chooser.set_files(pdf_path)
@@ -203,45 +232,36 @@ def get_pdf_files():
     files = [f for f in os.listdir(ARTICLES_DIR) if f.lower().endswith('.pdf')]
     return [os.path.join(ARTICLES_DIR, f) for f in files]
 
-def main(limit=None, browser_channel="chrome"):
+def main(limit=None, browser_channel="chrome", files_to_process=None):
     if not os.path.exists(ARTICLES_DIR):
         print(f"Error: Directory {ARTICLES_DIR} does not exist.")
         return
 
-    pdf_files = get_pdf_files()
-    
-    # Resume Skip Logic
-    if os.path.exists(OUTPUT_FILE):
-        try:
-            existing_df = pd.read_excel(OUTPUT_FILE)
-            if 'Source File' in existing_df.columns:
-                processed_files = set(existing_df['Source File'].dropna().astype(str).tolist())
-                # Normalize basenames for comparison
-                processed_basenames = {os.path.basename(f) for f in processed_files}
-                
-                # Filter out files whose basename matches processed files (or variants like "file (Run 2A)")
-                # Actually, our Source File just stores the basename or basename + suffix.
-                # A simple basename check might be best if we just strip suffixes.
-                # But 'A Fano 2025.pdf (Run 2A)' implies 'A Fano 2025.pdf' was processed.
-                
-                # Better approach: check if original filename is contained in any processed source file string
-                files_to_skip = []
-                for pf in pdf_files:
-                    basename = os.path.basename(pf)
-                    # Check if this basename appears in any recorded source file entry
-                    if any(basename in str(recorded) for recorded in processed_files):
-                        files_to_skip.append(pf)
-                
-                original_count = len(pdf_files)
-                pdf_files = [f for f in pdf_files if f not in files_to_skip]
-                print(f"Skipping {len(files_to_skip)} already processed files. {len(pdf_files)} remaining.")
-        except Exception as e:
-            print(f"Warning: Could not read existing output file for resume logic: {e}")
+    if files_to_process:
+        print(f"Targeted mode: Processing {len(files_to_process)} specific files.")
+        pdf_files = [os.path.join(ARTICLES_DIR, f) for f in files_to_process if os.path.exists(os.path.join(ARTICLES_DIR, f))]
+    else:
+        pdf_files = get_pdf_files()
+        # Resume Skip Logic
+        if os.path.exists(OUTPUT_FILE):
+            try:
+                existing_df = pd.read_excel(OUTPUT_FILE)
+                if 'Source File' in existing_df.columns:
+                    processed_files = set(existing_df['Source File'].dropna().astype(str).tolist())
+                    files_to_skip = []
+                    for pf in pdf_files:
+                        basename = os.path.basename(pf)
+                        if any(basename in str(recorded) for recorded in processed_files):
+                            files_to_skip.append(pf)
+                    pdf_files = [f for f in pdf_files if f not in files_to_skip]
+                    print(f"Skipping {len(files_to_skip)} already processed files. {len(pdf_files)} remaining.")
+            except Exception as e:
+                print(f"Warning: Could not read existing output file for resume logic: {e}")
 
-    if limit:
-        pdf_files = pdf_files[:int(limit)]
+        if limit:
+            pdf_files = pdf_files[:int(limit)]
     
-    print(f"Found {len(pdf_files)} PDF files to process.")
+    print(f"Total PDFs to process: {len(pdf_files)}")
 
     prompt_text = create_prompt()
     all_results = []
@@ -375,5 +395,6 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--limit", help="Limit number of files to process", default=None)
     parser.add_argument("--browser", help="Browser channel (chrome, msedge)", default="chrome")
+    parser.add_argument("--files", help="Specific files to process", nargs="+", default=None)
     args = parser.parse_args()
-    main(limit=args.limit, browser_channel=args.browser)
+    main(limit=args.limit, browser_channel=args.browser, files_to_process=args.files)

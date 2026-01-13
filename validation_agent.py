@@ -34,9 +34,13 @@ def create_validation_prompt(row_data):
     prompt += "2. For each field in the provided JSON, check if the value is correct.\n"
     prompt += "3. If a value is incorrect or incomplete, provide the correct information found in the PDF.\n"
     prompt += "4. If you find any discrepancies, return your findings in the following JSON format:\n"
-    prompt += '{\n  "discrepancies": [\n    {\n      "field": "Field Name",\n      "extracted_value": "Value provided in prompt",\n      "correct_value": "Correct value from PDF",\n      "description": "Explanation of the discrepancy"\n    }\n  ],\n  "status": "FAIL"\n}\n'
-    prompt += "5. If all information is 100% correct, return:\n"
+    prompt += '{\n  "discrepancies": [\n    {\n      "field": "Field Name",\n      "extracted_value": "Value provided in prompt",\n      "correct_value": "Correct value from PDF",\n      "severity": "CRITICAL", // or "MINOR"\n      "description": "Explanation of the discrepancy"\n    }\n  ],\n  "status": "FAIL"\n}\n'
+    prompt += "\n### SEVERITY CRITERIA ###\n"
+    prompt += "- MINOR: Formatting issues (e.g. '50 %' vs '50%'), synonyms (e.g. 'Male' vs 'Men'), or rounding differences less than 1%.\n"
+    prompt += "- CRITICAL: Different numbers (>1% variance), swapped data, missing data that exists in text, or hallucinations.\n"
+    prompt += "5. CRITICAL: If all information is 100% correct AND no additions/corrections are needed, return:\n"
     prompt += '{\n  "status": "PASS",\n  "discrepancies": []\n}\n'
+    prompt += "6. CRITICAL: If there is even a MINOR discrepancy, set status to 'FAIL' and list it with appropriate severity.\n"
     prompt += "\nReturn ONLY the JSON object."
     
     return prompt
@@ -62,31 +66,84 @@ def interact_with_gemini(page, pdf_path, prompt_text):
             plus_selectors = [
                 "button[aria-label*='Upload']",
                 "button[aria-label*='Add files']",
+                "button[aria-label*='Upload files']",
                 "button[aria-label*='file menu']",
                 "mat-icon:has-text('add')",
-                "span:has-text('add')"
+                "span:has-text('add')",
+                "button:has(mat-icon)",
+                "div[role='button']:has-text('add')"
             ]
             
             plus_found = False
+            
+            # TRY CLICKING TEXT AREA FIRST TO REVEAL BUTTONS
+            try:
+                page.locator("div[contenteditable='true'], textarea").first.click(timeout=5000)
+                time.sleep(1)
+            except:
+                pass
+
             for selector in plus_selectors:
-                btn = page.locator(selector).first
-                if btn.count() > 0 and btn.is_visible():
-                    print(f"[{os.path.basename(pdf_path)}] Found button with selector: {selector}")
-                    btn.click(force=True, timeout=10000)
-                    plus_found = True
-                    break
+                try:
+                    btn = page.locator(selector).first
+                    if btn.count() > 0 and btn.is_visible():
+                        print(f"[{os.path.basename(pdf_path)}] Found button with selector: {selector}")
+                        btn.click(force=True, timeout=10000)
+                        plus_found = True
+                        break
+                except:
+                    continue
             
             if not plus_found:
-                print(f"[{os.path.basename(pdf_path)}] Plus button not found. Taking diagnostic 'no_plus.png'")
+                print(f"[{os.path.basename(pdf_path)}] Plus button not found. Attempting generic click near input area...")
+                try:
+                    # Generic fallback: look for ANY button in the bottom input bar
+                    btn = page.locator("div.input-area button, .input-area-container button").first
+                    if btn.count() > 0:
+                         btn.click(force=True, timeout=5000)
+                         plus_found = True
+                except:
+                    pass
+
+            if not plus_found:
+                print(f"[{os.path.basename(pdf_path)}] Plus button still not found. Taking diagnostic 'no_plus.png'")
                 page.screenshot(path="no_plus.png")
                 return None
             
             time.sleep(2) # Wait for menu
             
-            # Click the 'Upload' item
-            upload_item = page.locator("div[role='menuitem'], span, li").filter(has_text=re.compile(r"Upload", re.I)).first
-            upload_item.wait_for(state="visible", timeout=15000)
-            upload_item.click(force=True)
+            # Click the 'Upload' item with retries and more selectors
+            upload_selectors = [
+                "div[role='menuitem']:has-text('Upload')",
+                "span:has-text('Upload')",
+                "li:has-text('Upload')",
+                "[aria-label*='Upload']",
+                ".mat-mdc-menu-item:has-text('Upload')"
+            ]
+            
+            upload_found = False
+            for target in upload_selectors:
+                try:
+                    upload_item = page.locator(target).first
+                    if upload_item.count() > 0 and upload_item.is_visible():
+                        upload_item.click(force=True, timeout=5000)
+                        upload_found = True
+                        break
+                except:
+                    continue
+            
+            if not upload_found:
+                 # Fallback: try finding any element with Upload text that is likely a menu item
+                 try:
+                    upload_item = page.get_by_text("Upload", exact=False).first
+                    upload_item.click(force=True, timeout=5000)
+                    upload_found = True
+                 except:
+                    pass
+
+            if not upload_found:
+                print(f"[{os.path.basename(pdf_path)}] Upload menu item not found.")
+                return None
         
         file_chooser = fc_info.value
         file_chooser.set_files(pdf_path)
@@ -146,6 +203,22 @@ def interact_with_gemini(page, pdf_path, prompt_text):
             json_str = last_response[start:end]
             try:
                 data = json.loads(json_str)
+                
+                # Check for severity and potentially downgrade FAIL to PASS
+                if data.get('status') == 'FAIL' and data.get('discrepancies'):
+                    critical_errors = [d for d in data['discrepancies'] if d.get('severity') == 'CRITICAL']
+                    if not critical_errors:
+                         print(f"[{os.path.basename(pdf_path)}] Downgrading FAIL to PASS (Only MINOR discrepancies found).")
+                         data['status'] = 'PASS'
+                
+                # Code-level Override: If Gemini hallucinates PASS but lists discrepancies, force FAIL
+                # (Only force FAIL if there are CRITICAL errors, otherwise let it PASS)
+                if data.get('status') == 'PASS' and data.get('discrepancies'):
+                    critical_errors = [d for d in data['discrepancies'] if d.get('severity', 'CRITICAL') == 'CRITICAL']
+                    if critical_errors:
+                        print(f"[{os.path.basename(pdf_path)}] Overriding PASS to FAIL due to CRITICAL discrepancies.")
+                        data['status'] = 'FAIL'
+
                 return data
             except:
                 print(f"[{os.path.basename(pdf_path)}] JSON parsing failed.")
@@ -157,7 +230,7 @@ def interact_with_gemini(page, pdf_path, prompt_text):
         print(f"[{os.path.basename(pdf_path)}] Interaction failed: {e}")
         return None
 
-def main(browser_channel="chrome"):
+def main(limit=None, browser_channel="chrome", files_to_validate=None):
     if not os.path.exists(INPUT_FILE):
         print(f"Error: {INPUT_FILE} not found.")
         return
@@ -167,10 +240,31 @@ def main(browser_channel="chrome"):
         print("Error: 'Source File' column missing in Excel.")
         return
     
+    # Filter by specific files if provided (Priority over limit)
+    if files_to_validate:
+        print(f"Targeted Validation: Checking {len(files_to_validate)} specific files.")
+        # Create a mask for matches (exact or partial string match if cleaner)
+        # Using exact match for robustness as Source File should be the full filename
+        df = df[df['Source File'].isin(files_to_validate)]
+    
+    # Apply limit if provided AND no specific files (OR apply limit to the specific files?)
+    elif limit:
+        print(f"Applying limit of {limit} rows for validation.")
+        df = df.head(int(limit))
+
     # Ensure Source File is string to avoid type warnings during matching
     df['Source File'] = df['Source File'].astype(object)
 
+    print(f"\n{Fore.CYAN}{'='*60}")
+    print(f"{Fore.CYAN}⚖️ STARTING DATA VALIDATION")
+    print(f"{Fore.CYAN}{'='*60}\n")
+
     validation_results = []
+    
+    # Store the full original dataframe to avoid truncation when saving
+    full_df = pd.read_excel(INPUT_FILE)
+    # We no longer add 'Result' or 'Validation Feedback' columns to the main file
+    # to keep it clean, but we still perform validation for the logs/healing.
 
     with sync_playwright() as p:
         profile_name = f"{browser_channel}_profile"
@@ -258,10 +352,6 @@ def main(browser_channel="chrome"):
             print(f"Failed to launch browser: {e}")
             return
 
-        print(f"\n{Fore.CYAN}{'='*60}")
-        print(f"{Fore.CYAN}⚖️ STARTING DATA VALIDATION")
-        print(f"{Fore.CYAN}{'='*60}\n")
-
         pbar = tqdm(df.iterrows(), total=len(df), desc=f"{Fore.YELLOW}Total Progress", unit="row")
         for index, row in pbar:
             source_file = row['Source File']
@@ -327,21 +417,30 @@ def main(browser_channel="chrome"):
                 result = interact_with_gemini(new_page, pdf_path, prompt_text)
                 if result:
                     result['Source File'] = source_file
+                    status = result.get('status', 'FAIL')
                     validation_results.append(result)
                     
-                    if result.get('status') == 'PASS':
+                    # Logic for console output and logging (DataFrame is NOT modified)
+                    if status == 'PASS':
                         tqdm.write(f"{Fore.GREEN}✔ {author_year[:30]} - PASS")
                     else:
-                        tqdm.write(f"{Fore.RED}✘ Discrepancy Found: {author_year[:30]}")
+                        # Aggregate discrepancy descriptions
                         for disc in result.get('discrepancies', []):
-                            tqdm.write(f"  {Fore.YELLOW}→ {disc.get('field')}: {disc.get('description')[:50]}...")
+                            field = disc.get('field', 'Unknown')
+                            sev = disc.get('severity', 'UNKNOWN')
+                            desc = disc.get('description', 'No description')
+                            color = Fore.RED if sev == 'CRITICAL' else Fore.YELLOW
+                            tqdm.write(f"  {color}→ [{sev}] {field}: {desc[:50]}...")
+                        
+                        tqdm.write(f"{Fore.RED}✘ Discrepancy Found: {author_year[:30]}")
+
                 else:
                     tqdm.write(f"{Fore.RED}✘ Interaction failed for {author_year}")
             finally:
                 new_page.close()
 
-            # Save the updated source file associations back to the main file
-            df.to_excel(INPUT_FILE, index=False)
+            # Save the full dataframe back to ensure no data loss
+            full_df.to_excel(INPUT_FILE, index=False)
 
             # Save incrementally
             if validation_results:
@@ -380,6 +479,8 @@ def main(browser_channel="chrome"):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
+    parser.add_argument("--limit", help="Limit number of rows to validate", default=None)
     parser.add_argument("--browser", help="Browser channel (chrome, msedge)", default="chrome")
+    parser.add_argument("--files", help="Specific files to validate", nargs="+", default=None)
     args = parser.parse_args()
-    main(browser_channel=args.browser)
+    main(limit=args.limit, browser_channel=args.browser, files_to_validate=args.files)
